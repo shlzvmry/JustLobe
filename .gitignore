@@ -1,0 +1,11 @@
+# 忽略前端依赖
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+
+# 忽略后端编译文件
+backend/backend.exe
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
