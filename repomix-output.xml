@@ -40,6 +40,10 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+.gitignore
+backend/chat.db
+backend/go.mod
+backend/main.go
 frontend/.gitignore
 frontend/.npmrc
 frontend/.prettierignore
@@ -62,6 +66,229 @@ frontend/vite.config.ts
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="backend/go.mod">
+module lobe-backend
+
+go 1.25.5
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/labstack/echo/v4 v4.15.0 // indirect
+	github.com/labstack/gommon v0.4.2 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/ncruces/go-strftime v0.1.9 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	github.com/valyala/fasttemplate v1.2.2 // indirect
+	golang.org/x/crypto v0.46.0 // indirect
+	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/net v0.48.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/text v0.32.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
+	modernc.org/libc v1.66.10 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
+	modernc.org/sqlite v1.42.2 // indirect
+)
+</file>
+
+<file path="backend/main.go">
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"database/sql" // Go 标准库的数据库接口
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	_ "modernc.org/sqlite" // 刚才安装的 SQLite 驱动
+)
+
+// --- 1. 配置与全局变量 ---
+const (
+	API_KEY = "sk-b828e1362f614206bde9ddf87b2476a2"
+	API_URL = "https://api.deepseek.com/chat/completions"
+	DB_FILE = "./chat.db" // 数据库文件名
+)
+
+var db *sql.DB // 全局数据库连接对象
+
+// 消息结构体
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ChatRequest struct {
+	Message string `json:"message"`
+}
+
+type StreamResponse struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// --- 2. 数据库初始化函数 ---
+func initDB() {
+	var err error
+	// 打开（或创建）数据库文件
+	db, err = sql.Open("sqlite", DB_FILE)
+	if err != nil {
+		log.Fatal("无法打开数据库:", err)
+	}
+
+	// 创建表结构：id, 角色(user/assistant), 内容
+	// IF NOT EXISTS 保证了如果表已经存在，就不会重复创建
+	sqlStmt := `
+	CREATE TABLE IF NOT EXISTS messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		role TEXT NOT NULL,
+		content TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	_, err = db.Exec(sqlStmt)
+	if err != nil {
+		log.Fatal("创建表失败:", err)
+	}
+	fmt.Println("数据库初始化成功，文件位置:", DB_FILE)
+}
+
+// 保存消息到数据库
+func saveMessage(role, content string) {
+	_, err := db.Exec("INSERT INTO messages (role, content) VALUES (?, ?)", role, content)
+	if err != nil {
+		log.Println("保存消息失败:", err)
+	}
+}
+
+func main() {
+	// 程序启动第一步：初始化数据库
+	initDB()
+	defer db.Close()
+
+	e := echo.New()
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"http://localhost:5173"},
+	}))
+
+	// --- 接口 A：获取历史记录 ---
+	e.GET("/api/history", func(c echo.Context) error {
+		rows, err := db.Query("SELECT role, content FROM messages ORDER BY id ASC")
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取历史失败"})
+		}
+		defer rows.Close()
+
+		var history []Message
+		for rows.Next() {
+			var msg Message
+			if err := rows.Scan(&msg.Role, &msg.Content); err == nil {
+				history = append(history, msg)
+			}
+		}
+		return c.JSON(http.StatusOK, history)
+	})
+
+	// --- 接口 B：聊天并保存 ---
+	e.POST("/api/chat", func(c echo.Context) error {
+		req := new(ChatRequest)
+		if err := c.Bind(req); err != nil {
+			return err
+		}
+
+		// 1. 先把用户的消息存进数据库
+		saveMessage("user", req.Message)
+
+		requestBody, _ := json.Marshal(map[string]interface{}{
+			"model": "deepseek-chat",
+			"messages": []map[string]string{
+				{"role": "system", "content": "你是一个有用的助手。"},
+				{"role": "user", "content": req.Message},
+			},
+			"stream": true,
+		})
+
+		client := &http.Client{}
+		httpReq, _ := http.NewRequest("POST", API_URL, bytes.NewBuffer(requestBody))
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+API_KEY)
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return c.String(http.StatusInternalServerError, "AI 连接失败")
+		}
+		defer resp.Body.Close()
+
+		c.Response().Header().Set(echo.HeaderContentType, "text/event-stream")
+		c.Response().WriteHeader(http.StatusOK)
+
+		// 用于累积 AI 的完整回复，最后存入数据库
+		var fullAIResponse strings.Builder
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				if data == "[DONE]" {
+					break
+				}
+
+				var streamResp StreamResponse
+				if err := json.Unmarshal([]byte(data), &streamResp); err == nil {
+					if len(streamResp.Choices) > 0 {
+						content := streamResp.Choices[0].Delta.Content
+						if content != "" {
+							// 累积内容
+							fullAIResponse.WriteString(content)
+							// 发送给前端
+							fmt.Fprintf(c.Response().Writer, "data: %s\n\n", content)
+							c.Response().Flush()
+						}
+					}
+				}
+			}
+		}
+
+		// 2. AI 说完了，把完整回复存进数据库
+		if fullAIResponse.Len() > 0 {
+			saveMessage("assistant", fullAIResponse.String())
+		}
+
+		return nil
+	})
+
+	fmt.Println("真 AI + 数据库后端已启动：http://localhost:8080")
+	e.Logger.Fatal(e.Start(":8080"))
+}
+</file>
+
+<file path=".gitignore">
+# 忽略前端依赖
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+
+# 忽略后端编译文件
+backend/backend.exe
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
+</file>
 
 <file path="frontend/.gitignore">
 node_modules
@@ -164,6 +391,10 @@ bun.lockb
 		"tailwindcss": "^4.1.17",
 		"typescript": "^5.9.3",
 		"vite": "^7.2.6"
+	},
+	"dependencies": {
+		"lucide-svelte": "^0.562.0",
+		"svelte-markdown": "^0.4.1"
 	}
 }
 </file>
@@ -223,6 +454,8 @@ declare global {
 }
 
 export {};
+
+declare module 'svelte-markdown';
 </file>
 
 <file path="frontend/src/app.html">
@@ -257,11 +490,6 @@ export {};
 
 <svelte:head><link rel="icon" href={favicon} /></svelte:head>
 {@render children()}
-</file>
-
-<file path="frontend/src/routes/+page.svelte">
-<h1>Welcome to SvelteKit</h1>
-<p>Visit <a href="https://svelte.dev/docs/kit">svelte.dev/docs/kit</a> to read the documentation</p>
 </file>
 
 <file path="frontend/src/routes/layout.css">
@@ -324,6 +552,201 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({ plugins: [tailwindcss(), sveltekit()] });
+</file>
+
+<file path="frontend/src/routes/+page.svelte">
+<script lang="ts">
+	import { Send, Menu, MessageSquare, User, Bot, Trash2, Plus } from 'lucide-svelte';
+	import { tick, onMount } from 'svelte'; // 引入 onMount
+	import SvelteMarkdown from 'svelte-markdown';
+
+	// --- 1. 状态定义 ---
+	let isSidebarOpen = $state(false);
+	let inputText = $state(''); 
+	let chatHistory = $state([
+		{ role: 'assistant', content: '你好！我是 LobeChat 助手。我已经准备好为你服务了。' }
+	]);
+
+	let scrollContainer: HTMLElement | undefined = $state();
+
+	// --- 2. 页面加载时：从后端数据库读取历史记录 ---
+	onMount(async () => {
+		try {
+			const response = await fetch('http://localhost:8080/api/history');
+			if (response.ok) {
+				const history = await response.json();
+				// 如果数据库里有记录，就替换掉默认的欢迎语
+				if (history && history.length > 0) {
+					chatHistory = history;
+					await scrollToBottom();
+				}
+			}
+		} catch (error) {
+			console.error('加载历史记录失败:', error);
+		}
+	});
+
+	// --- 3. 核心逻辑函数 ---
+
+	async function sendMessage() {
+		if (!inputText.trim()) return;
+
+		const userMessage = inputText;
+		chatHistory.push({ role: 'user', content: userMessage });
+		inputText = ''; 
+		await scrollToBottom();
+
+		try {
+			chatHistory.push({ role: 'assistant', content: '' });
+			const aiMsgIndex = chatHistory.length - 1;
+
+			const response = await fetch('http://localhost:8080/api/chat', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ message: userMessage })
+			});
+
+			if (!response.ok) throw new Error('后端响应错误');
+
+			const reader = response.body?.getReader();
+			const decoder = new TextDecoder();
+
+			if (reader) {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					const chunk = decoder.decode(value);
+					const lines = chunk.split('\n');
+					for (const line of lines) {
+						if (line.startsWith('data: ')) {
+							const content = line.replace('data: ', '');
+							chatHistory[aiMsgIndex].content += content;
+							await scrollToBottom();
+						}
+					}
+				}
+			}
+		} catch (error) {
+			console.error('连接后端失败:', error);
+			chatHistory.push({ role: 'assistant', content: '抱歉，我跟后端服务器失去联系了。' });
+			await scrollToBottom();
+		}
+	}
+
+	function handleKeyDown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			sendMessage();
+		}
+	}
+
+	async function scrollToBottom() {
+		await tick();
+		if (scrollContainer) {
+			scrollContainer.scrollTo({
+				top: scrollContainer.scrollHeight,
+				behavior: 'smooth'
+			});
+		}
+	}
+
+	function toggleSidebar() {
+		isSidebarOpen = !isSidebarOpen;
+	}
+
+	function clearChat() {
+		if (confirm('确定要清空所有聊天记录吗？这也会删除数据库里的记录。')) {
+			// 这里可以扩展一个删除数据库的接口，目前先简单清空界面
+			chatHistory = [{ role: 'assistant', content: '对话已清空。' }];
+		}
+	}
+</script>
+
+<div class="flex h-screen w-full bg-[#f8f9fa] text-[#333] overflow-hidden font-sans">
+	
+	<!-- 侧边栏 -->
+	<aside class="fixed inset-y-0 left-0 z-50 w-72 bg-white border-r border-gray-200 transform transition-transform duration-300 ease-in-out {isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 md:flex md:flex-col">
+		<div class="p-4 border-b border-gray-100 flex justify-between items-center">
+			<div class="flex items-center gap-2 font-bold text-lg text-blue-600">
+				<div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white text-sm">L</div>
+				LobeChat Mini
+			</div>
+			<button class="md:hidden p-2" onclick={toggleSidebar} aria-label="关闭侧边栏"><Menu size={20} /></button>
+		</div>
+		<div class="p-3">
+			<button onclick={() => chatHistory = [{ role: 'assistant', content: '新对话已开启！' }]} class="w-full flex items-center justify-center gap-2 bg-blue-600 text-white py-2 rounded-xl hover:bg-blue-700 transition shadow-md shadow-blue-100">
+				<Plus size={18} /> 新建对话
+			</button>
+		</div>
+		<nav class="flex-1 overflow-y-auto px-2 space-y-1">
+			<div class="flex items-center gap-3 p-3 bg-blue-50 text-blue-700 rounded-xl cursor-pointer">
+				<MessageSquare size={18} />
+				<span class="text-sm font-medium truncate">当前的智能对话</span>
+			</div>
+		</nav>
+		<div class="p-4 border-t border-gray-100 text-xs text-gray-400 text-center">
+			已连接 SQLite 数据库
+		</div>
+	</aside>
+
+	{#if isSidebarOpen}
+		<button class="fixed inset-0 bg-black/20 z-40 md:hidden w-full h-full border-none outline-none" onclick={toggleSidebar} aria-label="关闭遮罩"></button>
+	{/if}
+
+	<main class="flex flex-1 flex-col min-w-0 bg-white relative">
+		<header class="h-14 flex items-center justify-between px-4 border-b border-gray-100 bg-white/80 backdrop-blur-md sticky top-0 z-30">
+			<div class="flex items-center gap-3">
+				<button class="md:hidden p-2 -ml-2 text-gray-500" onclick={toggleSidebar} aria-label="打开侧边栏"><Menu size={20} /></button>
+				<div class="flex flex-col">
+					<span class="text-sm font-bold text-gray-700">DeepSeek-V3</span>
+					<span class="text-[10px] text-green-500 flex items-center gap-1">
+						<span class="w-1.5 h-1.5 bg-green-500 rounded-full"></span> 数据库已就绪
+					</span>
+				</div>
+			</div>
+			<button class="p-2 text-gray-400 hover:text-red-500 transition" onclick={clearChat} aria-label="清空对话"><Trash2 size={18} /></button>
+		</header>
+
+		<section bind:this={scrollContainer} class="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 scroll-smooth">
+			<div class="max-w-3xl mx-auto space-y-6">
+				{#each chatHistory as msg}
+					<div class="flex {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
+						<div class="flex max-w-[90%] md:max-w-[85%] gap-3 {msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}">
+							<div class="w-8 h-8 rounded-xl flex-shrink-0 flex items-center justify-center {msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'}">
+								{#if msg.role === 'user'} <User size={16} /> {:else} <Bot size={16} /> {/if}
+							</div>
+							<div class="px-4 py-2.5 rounded-2xl text-sm leading-relaxed shadow-sm {msg.role === 'user' ? 'bg-blue-600 text-white rounded-tr-none' : 'bg-[#f2f3f5] text-gray-800 rounded-tl-none'}">
+								<div class="markdown-body">
+									<SvelteMarkdown source={msg.content} />
+								</div>
+							</div>
+						</div>
+					</div>
+				{/each}
+			</div>
+		</section>
+
+		<footer class="p-4 bg-white border-t border-gray-100">
+			<div class="max-w-3xl mx-auto relative">
+				<div class="flex items-end gap-2 bg-[#f4f4f4] rounded-2xl p-2 border border-transparent focus-within:border-blue-400 focus-within:bg-white transition-all shadow-inner">
+					<textarea bind:value={inputText} onkeydown={handleKeyDown} placeholder="输入消息，Enter 发送..." class="flex-1 max-h-32 min-h-[40px] p-2 bg-transparent border-none focus:outline-none text-sm resize-none" rows="1"></textarea>
+					<button onclick={sendMessage} aria-label="发送消息" class="p-2 bg-blue-600 text-white rounded-xl disabled:opacity-30 disabled:bg-gray-400 transition-all hover:scale-105 active:scale-95" disabled={!inputText.trim()}><Send size={18} /></button>
+				</div>
+			</div>
+		</footer>
+	</main>
+</div>
+
+<style>
+	.markdown-body :global(p) { margin-bottom: 0.5rem; }
+	.markdown-body :global(p:last-child) { margin-bottom: 0; }
+	.markdown-body :global(code) { background: rgba(0,0,0,0.05); padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; }
+	.markdown-body :global(pre) { background: #2d2d2d; color: #ccc; padding: 1rem; border-radius: 8px; overflow-x: auto; margin: 0.5rem 0; }
+	
+	:global(::-webkit-scrollbar) { width: 4px; }
+	:global(::-webkit-scrollbar-thumb) { background: #e5e7eb; border-radius: 10px; }
+</style>
 </file>
 
 </files>

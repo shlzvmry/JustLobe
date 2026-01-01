@@ -26,5 +26,9 @@
 		"tailwindcss": "^4.1.17",
 		"typescript": "^5.9.3",
 		"vite": "^7.2.6"
+	},
+	"dependencies": {
+		"lucide-svelte": "^0.562.0",
+		"svelte-markdown": "^0.4.1"
 	}
 }
