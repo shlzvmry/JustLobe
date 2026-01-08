@@ -3,13 +3,13 @@
 	import { tick, onMount } from 'svelte';
 	import ChatItem from '$lib/components/ChatItem.svelte';
 
-	// 升级后的数据结构
+	// --- 数据结构 ---
 	type Message = {
 		role: string;
-		content: string; // 兼容旧数据
-		versions?: string[]; // 多版本列表
-		currentVersion?: number; // 当前选中的版本索引
-		isStopped?: boolean; // 是否被手动停止
+		content: string;
+		versions?: string[];
+		currentVersion?: number;
+		isStopped?: boolean;
 	};
 
 	type ChatSession = {
@@ -17,41 +17,48 @@
 		history: Message[];
 	};
 
+	// --- 状态管理 ---
 	let isSidebarOpen = $state(false);
 	let inputText = $state(''); 
 	let scrollContainer: HTMLElement | undefined = $state();
-	
-	let chatHistory = $state<Message[]>([{ role: 'assistant', content: '> **SYSTEM NOTICE**\n> 正在绕过付费验证...\n> 开发者模式已激活。\n> \n> 哪怕只有两周，我们也要优雅地完成作业。请下达指令。' }]);
-	let currentTitle = $state('Project Specification'); 
-	let archivedSessions = $state<ChatSession[]>([]); 
+	let sessions = $state<ChatSession[]>([
+		{ 
+			title: 'Project Specification', 
+			history: [{ role: 'assistant', content: '> **SYSTEM NOTICE**\n> 开发者模式已激活。\n> \n> 请下达指令。' }] 
+		}
+	]);
+	let activeIdx = $state(0);
+	let chatHistory = $derived(sessions[activeIdx].history);
+	let currentTitle = $derived(sessions[activeIdx].title);
 	
 	let showRenameModal = $state(false);
 	let tempTitle = $state(''); 
 	let isRenamingHistoryIndex = $state(-1);
 	let isLoading = $state(false);
 	let abortController: AbortController | null = null;
+	let generatingSession = $state<ChatSession | null>(null); // 记录哪个对话正在生成
 
-	onMount(async () => {
+	onMount(() => {
 		if (window.innerWidth > 768) isSidebarOpen = true;
-		const savedCurrent = localStorage.getItem('justlobe_current_session');
-		const savedArchives = localStorage.getItem('justlobe_archived_sessions');
-		if (savedArchives) try { archivedSessions = JSON.parse(savedArchives); } catch(e) {}
-		if (savedCurrent) {
-			try {
-				const session = JSON.parse(savedCurrent);
-				currentTitle = session.title;
-				chatHistory = session.history;
-				scrollToBottom();
-			} catch(e) {}
+		const saved = localStorage.getItem('justlobe_all_sessions_v2');
+		if (saved) {
+			try { sessions = JSON.parse(saved); } catch(e) {}
 		}
 	});
 
 	$effect(() => {
-		const currentSession = { title: currentTitle, history: chatHistory };
-		localStorage.setItem('justlobe_current_session', JSON.stringify(currentSession));
+		localStorage.setItem('justlobe_all_sessions_v2', JSON.stringify(sessions));
 	});
 
-	// --- 辅助函数：获取消息的当前显示内容 ---
+	// --- 核心逻辑 ---
+
+	function moveCurrentToTop() {
+		if (activeIdx === 0) return;
+		const [current] = sessions.splice(activeIdx, 1);
+		sessions.unshift(current);
+		activeIdx = 0;
+	}
+
 	function getMsgContent(msg: Message) {
 		if (msg.versions && msg.versions.length > 0) {
 			return msg.versions[msg.currentVersion || 0];
@@ -59,200 +66,186 @@
 		return msg.content;
 	}
 
-	// --- 辅助函数：设置消息内容（自动处理版本） ---
-	function setMsgContent(index: number, content: string, createNewVersion = false) {
-		const msg = chatHistory[index];
+	// 核心修复：显式传入 session 对象
+	function setMsgContent(session: ChatSession, msgIdx: number, content: string, createNewVersion = false) {
+		const msg = session.history[msgIdx];
 		if (!msg) return;
-
 		if (!msg.versions || msg.versions.length === 0) {
 			msg.versions = [msg.content || ''];
 			msg.currentVersion = 0;
 		}
-
 		if (createNewVersion) {
 			msg.versions.push(content);
 			msg.currentVersion = msg.versions.length - 1;
 		} else {
 			const verIdx = msg.currentVersion || 0;
-			if (msg.versions[verIdx] !== undefined) {
-				msg.versions[verIdx] = content;
-			}
+			msg.versions[verIdx] = content;
 		}
 		msg.content = content; 
 	}
 
-	function startNewSession() {
-		if (chatHistory.length > 1 || currentTitle !== 'Untitled Session') {
-			const sessionToArchive: ChatSession = { title: currentTitle, history: [...chatHistory] };
-			archivedSessions = [sessionToArchive, ...archivedSessions];
-			localStorage.setItem('justlobe_archived_sessions', JSON.stringify(archivedSessions));
-		}
-		chatHistory = [{ role: 'assistant', content: '> **NEW SESSION**\n> System ready.' }];
-		currentTitle = 'Untitled Session';
-		if (window.innerWidth < 768) isSidebarOpen = false;
-	}
-
-	function switchSession(index: number) {
-		const targetSession = archivedSessions[index]; 
-		const sessionToSave = { title: currentTitle, history: chatHistory };
-		const newArchives = [...archivedSessions];
-		newArchives.splice(index, 1);
-		if (sessionToSave.history.length > 1 || sessionToSave.title !== 'Untitled Session') newArchives.unshift(sessionToSave); 
-		archivedSessions = newArchives;
-		currentTitle = targetSession.title;
-		chatHistory = targetSession.history;
-		localStorage.setItem('justlobe_archived_sessions', JSON.stringify(archivedSessions));
-		if (window.innerWidth < 768) isSidebarOpen = false;
-		scrollToBottom();
-	}
-
-	function openRename(index = -1) {
-		isRenamingHistoryIndex = index;
-		tempTitle = index === -1 ? currentTitle : archivedSessions[index].title;
-		showRenameModal = true;
-	}
-
-	function handleRenameClick(e: MouseEvent, index: number) {
-		e.stopPropagation(); openRename(index);   
-	}
-
-	function confirmRename() {
-		if (tempTitle.trim()) {
-			if (isRenamingHistoryIndex === -1) currentTitle = tempTitle;
-			else {
-				archivedSessions[isRenamingHistoryIndex].title = tempTitle;
-				localStorage.setItem('justlobe_archived_sessions', JSON.stringify(archivedSessions));
-			}
-		}
-		showRenameModal = false;
-	}
-
-	// --- 核心逻辑区 ---
-	async function streamResponse(payloadMsg: string, targetMsgIndex: number) {
+	async function streamResponse(payloadMsg: string, targetMsgIndex: number, targetSession: ChatSession) {
 		try {
 			isLoading = true;
+			generatingSession = targetSession;
 			abortController = new AbortController();
-			
 			const res = await fetch('http://localhost:8080/api/chat', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ message: payloadMsg }), 
 				signal: abortController.signal
 			});
-
 			const reader = res.body?.getReader();
 			const decoder = new TextDecoder();
-
 			if (reader) {
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) break;
-					
 					const chunk = decoder.decode(value, { stream: true });
-					const currentText = getMsgContent(chatHistory[targetMsgIndex]);
 					
-					setMsgContent(targetMsgIndex, currentText + chunk, false);
-					
-					if (scrollContainer) scrollContainer.scrollTop = scrollContainer.scrollHeight;
+					// 1. 滚动判断：仅当用户正在看这个对话时才计算
+					const threshold = 100;
+					const isAtBottom = scrollContainer && (targetSession === sessions[activeIdx])
+						? (scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight < threshold)
+						: false;
+
+					// 2. 更新内容
+					const currentText = getMsgContent(targetSession.history[targetMsgIndex]);
+					setMsgContent(targetSession, targetMsgIndex, currentText + chunk, false);
+
+					// 3. 执行滚动
+					if (isAtBottom && scrollContainer) {
+						await tick();
+						scrollContainer.scrollTop = scrollContainer.scrollHeight;
+					}
 				}
 			}
 		} catch (e: any) {
-			if (e.name === 'AbortError') {
-				chatHistory[targetMsgIndex].isStopped = true;
-			} else {
-				const currentText = getMsgContent(chatHistory[targetMsgIndex]);
-				setMsgContent(targetMsgIndex, currentText + '\n> *Connection interrupted.*', false);
-			}
+			if (e.name === 'AbortError') targetSession.history[targetMsgIndex].isStopped = true;
+			else setMsgContent(targetSession, targetMsgIndex, getMsgContent(targetSession.history[targetMsgIndex]) + '\n> *Connection interrupted.*', false);
 		} finally {
 			isLoading = false;
 			abortController = null;
+			generatingSession = null;
 		}
 	}
 
 	async function sendMessage() {
 		if (!inputText.trim()) return;
+		const currentSession = sessions[activeIdx]; 
+		moveCurrentToTop();
 		const userMsg = inputText;
-		
-		chatHistory.push({ role: 'user', content: userMsg, versions: [userMsg], currentVersion: 0 });
+		currentSession.history.push({ role: 'user', content: userMsg, versions: [userMsg], currentVersion: 0 });
 		inputText = ''; 
 		await scrollToBottom();
-
-		chatHistory.push({ role: 'assistant', content: '', versions: [''], currentVersion: 0, isStopped: false });
-		const aiIdx = chatHistory.length - 1;
-
-		await streamResponse(userMsg, aiIdx);
+		currentSession.history.push({ role: 'assistant', content: '', versions: [''], currentVersion: 0, isStopped: false });
+		await streamResponse(userMsg, currentSession.history.length - 1, currentSession);
 	}
 
 	async function handleRegenerate(index: number) {
 		if (isLoading) return;
-		const userMsg = getMsgContent(chatHistory[index - 1]);
-		setMsgContent(index, '', true);
-		chatHistory[index].isStopped = false;
-		await streamResponse(userMsg, index);
+		const currentSession = sessions[activeIdx];
+		const userMsg = getMsgContent(currentSession.history[index - 1]);
+		setMsgContent(currentSession, index, '', true);
+		currentSession.history[index].isStopped = false;
+		await streamResponse(userMsg, index, currentSession);
 	}
 
-	// --- 逻辑修复：编辑并重新发送 ---
 	async function handleEdit(index: number, newContent: string) {
 		if (isLoading) return;
-		
-		// 1. 在用户消息上创建新版本
-		setMsgContent(index, newContent, true);
-		
+		const currentSession = sessions[activeIdx];
+		moveCurrentToTop(); 
+		setMsgContent(currentSession, index, newContent, true);
 		const aiMsgIndex = index + 1;
-		
-		// 2. 检查AI消息是否存在且配对
-		if (chatHistory[aiMsgIndex]?.role === 'assistant') {
-			// 在AI消息上也创建一个空的新版本
-			setMsgContent(aiMsgIndex, '', true);
-			chatHistory[aiMsgIndex].isStopped = false; // 清除停止状态
-			await streamResponse(newContent, aiMsgIndex);
+		if (currentSession.history[aiMsgIndex]?.role === 'assistant') {
+			setMsgContent(currentSession, aiMsgIndex, '', true);
+			currentSession.history[aiMsgIndex].isStopped = false;
+			await streamResponse(newContent, aiMsgIndex, currentSession);
 		} else {
-			// 如果后面没有AI消息（比如用户编辑最后一条），则截断并新建
-			chatHistory = chatHistory.slice(0, index + 1);
-			chatHistory.push({ role: 'assistant', content: '', versions: [''], currentVersion: 0, isStopped: false });
-			const newAiIndex = chatHistory.length - 1;
-			await streamResponse(newContent, newAiIndex);
+			currentSession.history = currentSession.history.slice(0, index + 1);
+			currentSession.history.push({ role: 'assistant', content: '', versions: [''], currentVersion: 0, isStopped: false });
+			await streamResponse(newContent, currentSession.history.length - 1, currentSession);
 		}
 	}
 
 	async function handleContinue(index: number) {
 		if (isLoading) return;
-		chatHistory[index].isStopped = false;
-		const currentText = getMsgContent(chatHistory[index]);
-		const prompt = `Please continue generating from the following text, without repeating it: "${currentText}"`;
-		await streamResponse(prompt, index);
-	}
-
-	// --- 逻辑修复：版本切换 ---
-	function handleSwitchVersion(index: number, versionIdx: number) {
-		const msg = chatHistory[index];
-		if (!msg || !msg.versions || versionIdx >= msg.versions.length) return;
-
-		// 1. 切换当前消息
-		msg.currentVersion = versionIdx;
-		msg.content = msg.versions[versionIdx];
-
-		// 2. 同步配对的消息
-		const pairIndex = msg.role === 'user' ? index + 1 : index - 1;
-		const pairMsg = chatHistory[pairIndex];
-
-		// 检查配对消息是否存在，且角色正确 (user 配 assistant, assistant 配 user)
-		if (pairMsg && ( (msg.role === 'user' && pairMsg.role === 'assistant') || (msg.role === 'assistant' && pairMsg.role === 'user') )) {
-			if (pairMsg.versions && versionIdx < pairMsg.versions.length) {
-				pairMsg.currentVersion = versionIdx;
-				pairMsg.content = pairMsg.versions[versionIdx];
-			}
-		}
+		const currentSession = sessions[activeIdx];
+		currentSession.history[index].isStopped = false;
+		const currentText = getMsgContent(currentSession.history[index]);
+		await streamResponse(`Please continue: "${currentText}"`, index, currentSession);
 	}
 
 	function stopGeneration() {
 		if (abortController) {
 			abortController.abort();
-			abortController = null;
 			isLoading = false;
-			chatHistory[chatHistory.length - 1].isStopped = true;
-			scrollToBottom();
+			if (generatingSession) {
+				generatingSession.history[generatingSession.history.length - 1].isStopped = true;
+			}
 		}
+	}
+
+	// --- 其他 UI 函数 ---
+	function startNewSession() {
+		sessions.unshift({
+			title: 'Untitled Session',
+			history: [{ role: 'assistant', content: '> **NEW SESSION**\n> System ready.' }]
+		});
+		activeIdx = 0;
+		if (window.innerWidth < 768) isSidebarOpen = false;
+	}
+
+	function switchSession(index: number) {
+		activeIdx = index;
+		if (window.innerWidth < 768) isSidebarOpen = false;
+		scrollToBottom();
+	}
+
+	function openRename(index = -1) {
+		isRenamingHistoryIndex = index;
+		tempTitle = index === -1 ? sessions[activeIdx].title : sessions[index].title;
+		showRenameModal = true;
+	}
+
+	function confirmRename() {
+		if (tempTitle.trim()) {
+			const targetIdx = isRenamingHistoryIndex === -1 ? activeIdx : isRenamingHistoryIndex;
+			sessions[targetIdx].title = tempTitle;
+		}
+		showRenameModal = false;
+	}
+
+	function deleteSession(index: number) {
+		if (sessions.length <= 1) {
+			alert('至少需要保留一个对话窗口。');
+			return;
+		}
+		
+		if (confirm('确定要删除这个对话吗？此操作不可撤销。')) {
+			// 如果删除的是当前正在生成的对话，先停止它
+			if (generatingSession === sessions[index]) {
+				stopGeneration();
+			}
+
+			sessions.splice(index, 1);
+
+			// 处理索引重置逻辑
+			if (index === activeIdx) {
+				// 如果删的是当前选中的，跳到前一个或第一个
+				activeIdx = Math.max(0, index - 1);
+			} else if (index < activeIdx) {
+				// 如果删的是当前选中之前的，索引需要减 1 保持指向正确
+				activeIdx--;
+			}
+		}
+	}
+
+	function handleSwitchVersion(index: number, versionIdx: number) {
+		const msg = sessions[activeIdx].history[index];
+		if (!msg || !msg.versions || versionIdx >= msg.versions.length) return;
+		msg.currentVersion = versionIdx;
+		msg.content = msg.versions[versionIdx];
 	}
 
 	function handleKeyDown(e: KeyboardEvent) {
@@ -265,8 +258,8 @@
 	}
 
 	async function clearChat() {
-		if (confirm('警告：此操作将永久抹除当前对话记录。确定执行？')) {
-			chatHistory = [{ role: 'assistant', content: '> **SYSTEM**\n> 内存已格式化。请重新开始。' }];
+		if (confirm('确定清空当前对话？')) {
+			sessions[activeIdx].history = [{ role: 'assistant', content: '> **SYSTEM**\n> 内存已格式化。' }];
 		}
 	}
 </script>
@@ -313,17 +306,57 @@
 				<button onclick={startNewSession} class="w-full border border-[#333] hover:border-[#DBBA87] text-[#888] hover:text-[#DBBA87] py-3 rounded-xl flex items-center justify-center gap-2 transition-all duration-300 text-sm uppercase tracking-widest bg-[#222]/50 hover:bg-[#2a2a2a]"><Plus size={16}/> New Thread</button>
 			</div>
 			<nav class="flex-1 p-2 space-y-2">
-				<div class="text-[10px] text-[#666] px-4 py-2 uppercase tracking-widest">History Logs</div>
-				<div class="group mx-2 p-3 rounded-xl bg-[#2a2a2a] border border-[#DBBA87]/40 text-[#fff] text-xs flex items-center gap-3 cursor-default relative shadow-lg">
-					<MessageSquare size={14} class="text-[#DBBA87]"/> <span class="truncate flex-1 font-serif pr-6 font-bold">{currentTitle}</span><div class="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]"></div>
-				</div>
-				{#each archivedSessions as session, i}
-					<div onclick={() => switchSession(i)} onkeydown={(e) => e.key === 'Enter' && switchSession(i)} role="button" tabindex="0" class="w-full group mx-2 p-3 rounded-xl bg-transparent border border-transparent text-[#999] text-xs flex items-center gap-3 hover:bg-[#222] hover:border-[#333] cursor-pointer transition-all relative text-left">
-						<History size={14} class="text-[#666] group-hover:text-[#DBBA87] transition-colors"/> <span class="truncate flex-1 font-serif pr-6 group-hover:text-[#ccc] transition-colors">{session.title}</span>
-						<button type="button" onclick={(e) => handleRenameClick(e, i)} class="absolute right-2 opacity-0 group-hover:opacity-100 transition-opacity text-[#666] hover:text-[#DBBA87] p-1 bg-transparent border-none cursor-pointer" aria-label="Rename"><Edit2 size={12} /></button>
-					</div>
-				{/each}
-			</nav>
+    <div class="text-[10px] text-[#666] px-4 py-2 uppercase tracking-widest">History Logs</div>
+    
+    {#each sessions as session, i}
+        <div 
+            onclick={() => switchSession(i)} 
+            onkeydown={(e) => e.key === 'Enter' && switchSession(i)} 
+            role="button" 
+            tabindex="0" 
+            class="w-full group mx-2 p-3 rounded-xl border transition-all relative text-left flex items-center gap-3 cursor-pointer
+            {i === activeIdx 
+                ? 'bg-[#2a2a2a] border-[#DBBA87]/40 text-[#fff] shadow-lg' 
+                : 'bg-transparent border-transparent text-[#999] hover:bg-[#222] hover:border-[#333]'}"
+        >
+            {#if i === activeIdx}
+                <MessageSquare size={14} class="text-[#DBBA87]"/>
+            {:else}
+                <History size={14} class="text-[#666] group-hover:text-[#DBBA87] transition-colors"/>
+            {/if}
+
+            <span class="truncate flex-1 font-serif pr-12 {i === activeIdx ? 'font-bold' : 'group-hover:text-[#ccc]'}">
+                {session.title}
+            </span>
+
+            {#if i === activeIdx}
+                <div class="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]"></div>
+            {/if}
+
+            <!-- 操作按钮容器（仅在悬停时显示） -->
+            <div class="absolute right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <!-- 重命名按钮 -->
+                <button 
+                    type="button" 
+                    onclick={(e) => { e.stopPropagation(); openRename(i); }} 
+                    class="text-[#666] hover:text-[#DBBA87] p-1 bg-transparent border-none cursor-pointer"
+                    title="Rename"
+                >
+                    <Edit2 size={12} />
+                </button>
+                <!-- 删除按钮 -->
+                <button 
+                    type="button" 
+                    onclick={(e) => { e.stopPropagation(); deleteSession(i); }} 
+                    class="text-[#666] hover:text-red-400 p-1 bg-transparent border-none cursor-pointer"
+                    title="Delete"
+                >
+                    <Trash2 size={12} />
+                </button>
+            </div>
+        </div>
+    {/each}
+</nav>
 			<div class="p-4 text-[10px] text-[#555] border-t border-[#333] text-center font-serif italic whitespace-nowrap truncate opacity-70 hover:opacity-100 transition-opacity">"Powered by Code & Caffeine."</div>
 		</div>
 	</aside>
@@ -345,20 +378,22 @@
 		</header>
 
 		<section bind:this={scrollContainer} class="flex-1 overflow-y-auto p-4 md:p-8 space-y-8 scroll-smooth">
-			<div class="max-w-4xl mx-auto space-y-8">
-				{#each chatHistory as msg, i}
-					<ChatItem 
-						{msg} 
-						index={i} 
-						isLast={i === chatHistory.length - 1} 
-						onEdit={handleEdit} 
-						onRegenerate={handleRegenerate}
-						onSwitchVersion={handleSwitchVersion}
-						onContinue={handleContinue}
-					/>
-				{/each}
-			</div>
-		</section>
+    <div class="max-w-4xl mx-auto space-y-8">
+       <!-- 找到这一行 -->
+<!-- 修改这一行 -->
+{#each chatHistory as msg, i (msg.content + i)}
+    <ChatItem 
+        {msg} 
+        index={i} 
+        isLast={i === chatHistory.length - 1} 
+        onEdit={handleEdit} 
+        onRegenerate={handleRegenerate}
+        onSwitchVersion={handleSwitchVersion}
+        onContinue={handleContinue}
+    />
+{/each}
+    </div>
+</section>
 
 		<footer class="p-6">
 			<div class="max-w-4xl mx-auto">

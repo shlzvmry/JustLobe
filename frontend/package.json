@@ -28,6 +28,10 @@
 		"vite": "^7.2.6"
 	},
 	"dependencies": {
+		"@esbuild/win32-x64": "0.27.2",
+		"esbuild": "0.27.2",
+		"esbuild-wasm": "0.27.2",
+		"highlight.js": "^11.11.1",
 		"lucide-svelte": "^0.562.0",
 		"svelte-markdown": "^0.4.1"
 	}
